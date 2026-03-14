@@ -19,10 +19,8 @@ import './App.css'
 import { panelPresets, customPanelDefaults } from './data/panelPresets'
 import {
   kharkivDefaults,
-  monthOptions,
-  timeOptions,
 } from './utils/constants'
-import { calculateSolarMetrics } from './utils/solarMath'
+import { calculateSolarMetrics, getDateFromDayOfYear, getSunriseSunsetOptions } from './utils/solarMath'
 import { calculateFieldShading, getPanelWidthAcrossRowMeters } from './utils/solar3d'
 import { estimateMonthlyYield } from './utils/yieldEstimator'
 import type { CalculatorState, Orientation, PanelSpec, YieldResult } from './types'
@@ -70,20 +68,27 @@ const initialPanelRunM = (panelPresets[0].lengthMm / 1000) * Math.cos(45 * DEG_T
 const initialState: CalculatorState = {
   panelSelection: panelPresets[0].id,
   customPanel: customPanelDefaults,
-  panelsPerRow: 4,
+  panelsPerRow: 20,
   rowsCount: 2,
-  rowPitchM: 3.2 + initialPanelRunM,
-  rowSpacingM: 3.2,
-  tiltDeg: 45,
+  rowPitchM: 1.5 + initialPanelRunM,
+  rowSpacingM: 1.5,
+  panelGapM: 0,
+  tiltDeg: 35,
   groundTiltDeg: 0,
   groundTiltAzimuthDeg: 0,
   orientation: 'portrait',
   panelAzimuthDeg: 180,
   latitude: kharkivDefaults.latitude,
   longitude: kharkivDefaults.longitude,
-  monthIndex: new Date().getMonth(),
+  dayOfYear: Math.floor(
+    (Date.now() - new Date(new Date().getFullYear(), 0, 0).getTime()) / 1000 / 60 / 60 / 24,
+  ),
   timeLabel: '12:00',
   performanceRatio: 0.8,
+  temperatureC: 25,
+  windSpeedMs: 5,
+  windAzimuthDeg: 180,
+  mountHeightCm: 0,
 }
 
 const toFixed = (value: number, digits = 2) => Number(value.toFixed(digits))
@@ -180,8 +185,7 @@ const SliderControl = ({
 type HeavyPayload = {
   latitude: number
   longitude: number
-  monthIndex: number
-  timeLabel: string
+  dayOfYear: number
   tiltDeg: number
   panelAzimuthDeg: number
   panelSpec: PanelSpec
@@ -192,51 +196,71 @@ type HeavyPayload = {
 
 const buildHeavyPayload = (calculatorState: CalculatorState): HeavyPayload => {
   const selectedPanel = getPanelSpecForState(calculatorState)
-  const previewMetrics = calculateSolarMetrics({
-    latitude: calculatorState.latitude,
-    longitude: calculatorState.longitude,
-    monthIndex: calculatorState.monthIndex,
-    timeLabel: calculatorState.timeLabel,
-    tiltDeg: calculatorState.tiltDeg,
-    panelAzimuthDeg: calculatorState.panelAzimuthDeg,
-    rowSpacingM: calculatorState.rowSpacingM,
-    panelSpec: selectedPanel,
-    orientation: calculatorState.orientation,
-  })
 
   const panelWidthAcrossRowM = getPanelWidthAcrossRowMeters(
     selectedPanel.lengthMm,
     selectedPanel.widthMm,
     calculatorState.orientation,
   )
-  const fieldShading = calculateFieldShading({
-    rowsCount: calculatorState.rowsCount,
-    panelsPerRow: calculatorState.panelsPerRow,
-    rowSpacingM: calculatorState.rowSpacingM,
-    panelRunM: previewMetrics.panelRunM,
-    panelTopHeightM: previewMetrics.panelTopHeightM,
-    panelWidthAcrossRowM,
-    panelAzimuthDeg: calculatorState.panelAzimuthDeg,
-    solarAzimuthDeg: previewMetrics.solarAzimuthDeg,
-    solarAltitudeDeg: previewMetrics.solarAltitudeDeg,
-      groundTiltDeg: calculatorState.groundTiltDeg,
-      groundTiltAzimuthDeg: calculatorState.groundTiltAzimuthDeg,
-      sunAboveHorizon: previewMetrics.sunAboveHorizon,
-    frontSideIrradiance: previewMetrics.frontSideIrradiance,
-  })
   const totalPanels = calculatorState.rowsCount * calculatorState.panelsPerRow
+
+  // Calculate daily average shading for the HeavyPayload so the monthly yield doesn't jump with the Time of Day slider.
+  // We use an irradiance-weighted average: shadows at noon matter more than shadows at sunrise.
+  const currentDate = getDateFromDayOfYear(calculatorState.dayOfYear)
+  const timeOptions = getSunriseSunsetOptions(calculatorState.latitude, calculatorState.longitude, currentDate)
+  let weightedShadeSum = 0
+  let totalWeight = 0
+
+  for (const timeOpt of timeOptions) {
+    const tempMetrics = calculateSolarMetrics({
+      latitude: calculatorState.latitude,
+      longitude: calculatorState.longitude,
+      dayOfYear: calculatorState.dayOfYear,
+      timeLabel: timeOpt,
+      tiltDeg: calculatorState.tiltDeg,
+      panelAzimuthDeg: calculatorState.panelAzimuthDeg,
+      rowSpacingM: calculatorState.rowSpacingM,
+      panelSpec: selectedPanel,
+      orientation: calculatorState.orientation,
+    })
+
+    // Weight by incidence factor (clamped to 0 for sun behind panels)
+    const weight = tempMetrics.sunAboveHorizon ? Math.max(0, tempMetrics.incidenceFactor) : 0
+
+    if (weight > 1e-6) {
+      const tempShading = calculateFieldShading({
+        rowsCount: calculatorState.rowsCount,
+        panelsPerRow: calculatorState.panelsPerRow,
+        rowSpacingM: calculatorState.rowSpacingM,
+        panelRunM: tempMetrics.panelRunM,
+        panelTopHeightM: tempMetrics.panelTopHeightM,
+        panelWidthAcrossRowM,
+        panelAzimuthDeg: calculatorState.panelAzimuthDeg,
+        solarAzimuthDeg: tempMetrics.solarAzimuthDeg,
+        solarAltitudeDeg: tempMetrics.solarAltitudeDeg,
+        groundTiltDeg: calculatorState.groundTiltDeg,
+        groundTiltAzimuthDeg: calculatorState.groundTiltAzimuthDeg,
+        sunAboveHorizon: tempMetrics.sunAboveHorizon,
+        frontSideIrradiance: tempMetrics.frontSideIrradiance,
+      })
+
+      weightedShadeSum += tempShading.fieldShadingPercent * weight
+      totalWeight += weight
+    }
+  }
+
+  const avgDailyShadePercent = totalWeight > 0 ? weightedShadeSum / totalWeight : 0
 
   return {
     latitude: calculatorState.latitude,
     longitude: calculatorState.longitude,
-    monthIndex: calculatorState.monthIndex,
-    timeLabel: calculatorState.timeLabel,
+    dayOfYear: calculatorState.dayOfYear,
     tiltDeg: calculatorState.tiltDeg,
     panelAzimuthDeg: calculatorState.panelAzimuthDeg,
     panelSpec: selectedPanel,
     panelCount: totalPanels,
     performanceRatio: calculatorState.performanceRatio,
-    shadingLossFactor: Math.max(0.55, 1 - fieldShading.maxPanelShadingPercent / 100),
+    shadingLossFactor: Math.max(0.55, 1 - avgDailyShadePercent / 100),
   }
 }
 
@@ -279,7 +303,7 @@ const sanitizeState = (raw: unknown): CalculatorState => {
       (candidate as { panelsPerRow?: number }).panelsPerRow ?? derivedPanelsPerRowFromLegacy,
       initialState.panelsPerRow,
       1,
-      10,
+      100,
     ),
     rowsCount: sanitizedRowsCount,
     rowPitchM: sanitizeNumber(
@@ -289,6 +313,7 @@ const sanitizeState = (raw: unknown): CalculatorState => {
       20,
     ),
     rowSpacingM: sanitizeNumber(candidate.rowSpacingM, initialState.rowSpacingM, 0, 10),
+    panelGapM: sanitizeNumber(candidate.panelGapM, initialState.panelGapM, 0, 1.0),
     tiltDeg: sanitizeNumber(candidate.tiltDeg, initialState.tiltDeg, 0, 90),
     groundTiltDeg: sanitizeNumber(candidate.groundTiltDeg, initialState.groundTiltDeg, -10, 10),
     groundTiltAzimuthDeg: sanitizeNumber(candidate.groundTiltAzimuthDeg, initialState.groundTiltAzimuthDeg, -180, 180),
@@ -296,12 +321,16 @@ const sanitizeState = (raw: unknown): CalculatorState => {
     panelAzimuthDeg: sanitizeNumber(candidate.panelAzimuthDeg, initialState.panelAzimuthDeg, 0, 360),
     latitude: sanitizeNumber(candidate.latitude, initialState.latitude, -90, 90),
     longitude: sanitizeNumber(candidate.longitude, initialState.longitude, -180, 180),
-    monthIndex: sanitizeNumber(candidate.monthIndex, initialState.monthIndex, 0, 11),
+    dayOfYear: sanitizeNumber(candidate.dayOfYear, initialState.dayOfYear, 1, 365),
     timeLabel:
-      typeof candidate.timeLabel === 'string' && timeOptions.includes(candidate.timeLabel)
+      typeof candidate.timeLabel === 'string'
         ? candidate.timeLabel
         : initialState.timeLabel,
     performanceRatio: sanitizeNumber(candidate.performanceRatio, initialState.performanceRatio, 0.6, 0.9),
+    temperatureC: sanitizeNumber(candidate.temperatureC, initialState.temperatureC, -30, 30),
+    windSpeedMs: sanitizeNumber(candidate.windSpeedMs, initialState.windSpeedMs, 0, 30),
+    windAzimuthDeg: sanitizeNumber(candidate.windAzimuthDeg, initialState.windAzimuthDeg, 0, 360),
+    mountHeightCm: sanitizeNumber(candidate.mountHeightCm, initialState.mountHeightCm, 0, 100),
   }
 
   return withSpacingConstraint(sanitized)
@@ -334,7 +363,7 @@ function App() {
       calculateSolarMetrics({
         latitude: state.latitude,
         longitude: state.longitude,
-        monthIndex: state.monthIndex,
+        dayOfYear: state.dayOfYear,
         timeLabel: state.timeLabel,
         tiltDeg: state.tiltDeg,
         panelAzimuthDeg: state.panelAzimuthDeg,
@@ -345,7 +374,7 @@ function App() {
     [
       state.latitude,
       state.longitude,
-      state.monthIndex,
+      state.dayOfYear,
       state.timeLabel,
       state.tiltDeg,
       state.panelAzimuthDeg,
@@ -398,14 +427,16 @@ function App() {
       const result = await estimateMonthlyYield({
         latitude: heavyPayload.latitude,
         longitude: heavyPayload.longitude,
-        monthIndex: heavyPayload.monthIndex,
-        timeLabel: heavyPayload.timeLabel,
+        dayOfYear: heavyPayload.dayOfYear,
         tiltDeg: heavyPayload.tiltDeg,
         azimuthCompassDeg: heavyPayload.panelAzimuthDeg,
         panelSpec: heavyPayload.panelSpec,
         panelCount: heavyPayload.panelCount,
         performanceRatio: heavyPayload.performanceRatio,
         shadingLossFactor: heavyPayload.shadingLossFactor,
+        panelAzimuthDeg: heavyPayload.panelAzimuthDeg,
+        rowSpacingM: state.rowSpacingM,
+        orientation: state.orientation,
       })
 
       if (!active) {
@@ -421,7 +452,7 @@ function App() {
     return () => {
       active = false
     }
-  }, [heavyPayload])
+  }, [heavyPayload, state.rowSpacingM, state.orientation])
 
   useEffect(() => {
     window.localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(state))
@@ -436,10 +467,10 @@ function App() {
       const nextRaw =
         key === 'rowSpacingM'
           ? {
-              ...prev,
-              rowSpacingM: value as number,
-              rowPitchM: (value as number) + getPanelRunMForState(prev),
-            }
+            ...prev,
+            rowSpacingM: value as number,
+            rowPitchM: (value as number) + getPanelRunMForState(prev),
+          }
           : { ...prev, [key]: value }
       const next = withSpacingConstraint(nextRaw)
       if (trigger) {
@@ -466,7 +497,32 @@ function App() {
   }
 
   const isCustom = state.panelSelection === 'custom'
-  const timeSliderIndex = Math.max(0, timeOptions.indexOf(state.timeLabel))
+
+  const currentDate = getDateFromDayOfYear(state.dayOfYear)
+  const timeOptions = useMemo(() => {
+    return getSunriseSunsetOptions(state.latitude, state.longitude, currentDate)
+  }, [state.latitude, state.longitude, currentDate])
+
+  let timeSliderIndex = timeOptions.indexOf(state.timeLabel)
+  if (timeSliderIndex === -1) {
+    // If current time is no longer in the valid bounds, clamp it visually to the closest edge
+    const [h, m] = state.timeLabel.split(':').map(Number)
+    const currentMins = h * 60 + m
+
+    // Find closest valid time
+    let closestIdx = 0
+    let minDiff = Infinity
+    for (let i = 0; i < timeOptions.length; i += 1) {
+      const [optH, optM] = timeOptions[i].split(':').map(Number)
+      const optMins = optH * 60 + optM
+      const diff = Math.abs(optMins - currentMins)
+      if (diff < minDiff) {
+        minDiff = diff
+        closestIdx = i
+      }
+    }
+    timeSliderIndex = closestIdx
+  }
 
   const totalPanels = state.panelsPerRow * state.rowsCount
   const totalSystemKw = (panelSpec.powerW * totalPanels) / 1000
@@ -474,6 +530,125 @@ function App() {
   const baseFieldWidthX =
     state.rowsCount > 0 ? state.rowsCount * projectedPanelRunM + Math.max(state.rowsCount - 1, 0) * state.rowSpacingM : 0
   const totalProjectedFieldWidthM = baseFieldWidthX * Math.cos((Math.abs(state.groundTiltDeg) * Math.PI) / 180)
+
+  // Real-time Clear Sky Simulation
+  // Assuming a max clear-sky irradiance of 1000 W/m² (900 Direct + 100 Diffuse scatter)
+  // Direct irradiance scales down by cos(incidence_angle) and drops to 0 if sun is below horizon or behind the panel
+  // Diffuse is available whenever the sun is above horizon
+  let currentPowerKw = 0
+  let systemCurrent = 0
+  let systemVoltage = 0 // Vmp (Operating)
+  let systemVoc = 0    // Voc (Open Circuit - for safety/specs)
+
+  if (metrics.sunAboveHorizon) {
+    const rawDirectW = Math.max(0, 900 * metrics.incidenceFactor)
+    const diffuseW = 100
+
+    // Voltage stays relatively constant across a string, but degrades with heat.
+    // Typical crystalline silicon temp coefficient for Voltage is ~ -0.3% / °C (Vmp)
+    // and ~ -0.25% / °C (Voc).
+    const TEMP_COEFF_VMP = -0.003
+    const TEMP_COEFF_VOC = -0.0025
+    const tempDiffC = state.temperatureC - 25 // 25°C is Standard Test Conditions (STC)
+
+    const vmpAdjusted = panelSpec.vmp * (1 + TEMP_COEFF_VMP * tempDiffC)
+    const vocAdjusted = panelSpec.voc * (1 + TEMP_COEFF_VOC * tempDiffC)
+
+    let activeSystemVoltage = 0
+
+    // Calculate total power and voltage considering shading
+    for (let r = 0; r < state.rowsCount; r++) {
+      const rowShadeFraction = fieldShading.rowShadingFractions[r] ?? 0
+
+      // Bypass Diode Model:
+      // When a section of a panel is shaded, bypass diodes activate to prevent high series resistance
+      // and hotspot damage. This drops the specific section out of the circuit, removing its Voltage
+      // from the total string summation, but enabling the unshaded sections to pass optimal current.
+      // We assume shade triggers proportional fractional diode bypass.
+      const activeVoltageFraction = 1 - rowShadeFraction
+      const rowActiveVoltage = vmpAdjusted * state.panelsPerRow * activeVoltageFraction
+      activeSystemVoltage += rowActiveVoltage
+
+      // Direct light is linearly blocked by shade. Diffuse light remains fully available.
+      // E.g. 100% shade = 0 direct + 100 diffuse = ~10% ambient power.
+      const directIncidentW = rawDirectW * (1 - rowShadeFraction)
+      const totalIrradianceW = directIncidentW + diffuseW
+      // Module efficiency converts irradiance into electricity
+      const rowPowerW = totalIrradianceW * panelSpec.lengthMm / 1000 * panelSpec.widthMm / 1000 * panelSpec.efficiency / 100 * state.panelsPerRow
+      currentPowerKw += rowPowerW / 1000
+    }
+
+    // Assign final bypassed total voltage block
+    systemVoltage = activeSystemVoltage
+    // Voc is the "safety" voltage, usually we care about the cold Voc of the entire string
+    systemVoc = vocAdjusted * (state.rowsCount * state.panelsPerRow)
+
+    // In a pure series connection, system current is effectively total Power / total Voltage
+    systemCurrent = systemVoltage > 0 ? (currentPowerKw * 1000) / systemVoltage : 0
+  }
+
+  // --- Advanced Wind Load Model (Eurocode 1 / NEN 7250) ---
+  const q_pa = 0.613 * Math.pow(state.windSpeedMs, 2)
+  const panelAreaM2 = (panelSpec.lengthMm / 1000) * (panelSpec.widthMm / 1000)
+
+  // Angle of wind relative to panel face (0 = direct head-on, 180 = direct back-on)
+  const relativeWindAz = Math.abs(((state.windAzimuthDeg - state.panelAzimuthDeg + 540) % 360) - 180)
+  const cosRel = Math.cos((relativeWindAz * Math.PI) / 180)
+  const isNorthWind = relativeWindAz > 90 // Wind hitting the back of panels
+
+  // Shielding factor (Psi) based on d/h ratio
+  // d = clear distance between rows (rowSpacingM)
+  // h = total height (panelTopHeightM + mountHeightM)
+  const mountHeightM = state.mountHeightCm / 100
+  const totalHeightH = Math.max(metrics.panelTopHeightM + mountHeightM, 0.1)
+  const d_h_ratio = state.rowSpacingM / totalHeightH
+  const psi = d_h_ratio <= 2.0 ? 0.53 : d_h_ratio >= 4.0 ? 1.0 : 0.53 + (d_h_ratio - 2.0) * (0.47 / 2.0)
+
+  let totalUpliftN = 0
+  let totalDragN = 0
+
+  for (let r = 0; r < state.rowsCount; r++) {
+    const rowArea = state.panelsPerRow * panelAreaM2
+    let cp_uplift = 1.5 // Multiplier for exposed row
+
+    if (isNorthWind) {
+      // North wind hits the back: worst case Cp = 2.0 for all rows (no shielding effectively)
+      cp_uplift = 2.0
+    } else {
+      // South wind hits the front: Row 0 is exposed, others shielded
+      if (r > 0) {
+        cp_uplift = 0.8 * psi
+      }
+    }
+
+    const tiltRad = (state.tiltDeg * Math.PI) / 180
+    // Uplift peaks at 45 deg, 0 at 0 and 90 deg
+    const tiltUpliftScaling = Math.sin(2 * tiltRad)
+    // Drag peaks at 90 deg, 0 at 0 deg
+    const tiltDragScaling = Math.pow(Math.sin(tiltRad), 2)
+
+    // Scale by direction: peaks at 0/180 (head-on), drops at 90 (side wind)
+    const directionScale = Math.abs(cosRel)
+
+    const rowUpliftN = q_pa * cp_uplift * rowArea * directionScale * tiltUpliftScaling
+    const rowDragN = q_pa * 2.1 * rowArea * directionScale * tiltDragScaling // 2.1 is typical Cd for flat plate
+
+    totalUpliftN += rowUpliftN
+    totalDragN += rowDragN
+  }
+
+  // --- Gap Effect (Openness Adjustment) ---
+  // When panels are lifted, air flows underneath: 
+  // 1. Drag decreases (less stagnation pressure)
+  // 2. Uplift increases (high pressure underside + suction topside = parasail effect)
+  const gapFraction = state.mountHeightCm / 100
+  const dragMultiplier = 1 - 0.2 * gapFraction
+  const upliftMultiplier = 1 + 0.3 * gapFraction
+
+  const windUpliftKg = (totalUpliftN * upliftMultiplier) / 9.81
+  const windDragKg = (totalDragN * dragMultiplier) / 9.81
+  const windTotalKg = Math.sqrt(Math.pow(windUpliftKg, 2) + Math.pow(windDragKg, 2))
+
 
   return (
     <Stack className="app-shell" gap="lg">
@@ -606,26 +781,72 @@ function App() {
               <Divider />
 
               <SliderControl
-                title="Month"
-                currentLabel={monthOptions[state.monthIndex]}
-                minLabel={monthOptions[0]}
-                maxLabel={monthOptions[11]}
-                value={state.monthIndex}
-                min={0}
-                max={11}
+                title="Temperature"
+                currentLabel={`${state.temperatureC > 0 ? '+' : ''}${state.temperatureC}°C`}
+                minLabel="-30°C"
+                maxLabel="+30°C"
+                value={state.temperatureC}
+                min={-30}
+                max={30}
                 step={1}
-                onChange={(value) => updateState('monthIndex', value)}
+                onChange={(value) => updateState('temperatureC', value)}
+                onChangeEnd={() => triggerHeavyRecalc()}
+              />
+
+              <SliderControl
+                title="Wind speed"
+                currentLabel={`${state.windSpeedMs} m/s`}
+                minLabel="0 m/s"
+                maxLabel="30 m/s"
+                value={state.windSpeedMs}
+                min={0}
+                max={30}
+                step={1}
+                onChange={(value) => updateState('windSpeedMs', value)}
+                onChangeEnd={() => triggerHeavyRecalc()}
+              />
+
+              <SliderControl
+                title="Wind direction"
+                currentLabel={(() => {
+                  const v = state.windAzimuthDeg
+                  if (v === 0 || v === 360) return 'North (0°)'
+                  if (v === 90) return 'East (90°)'
+                  if (v === 180) return 'South (180°)'
+                  if (v === 270) return 'West (270°)'
+                  return `${v}°`
+                })()}
+                minLabel="0° N"
+                maxLabel="360°"
+                value={state.windAzimuthDeg}
+                min={0}
+                max={360}
+                step={5}
+                onChange={(value) => updateState('windAzimuthDeg', value)}
+                onChangeEnd={() => triggerHeavyRecalc()}
+              />
+
+              <SliderControl
+                title="Date"
+                currentLabel={currentDate.toLocaleDateString('en-GB', { month: 'short', day: 'numeric' })}
+                minLabel="1 Jan"
+                maxLabel="31 Dec"
+                value={state.dayOfYear}
+                min={1}
+                max={365}
+                step={1}
+                onChange={(value) => updateState('dayOfYear', value)}
                 onChangeEnd={() => triggerHeavyRecalc()}
               />
 
               <SliderControl
                 title="Time of day"
-                currentLabel={state.timeLabel}
+                currentLabel={timeOptions[timeSliderIndex]}
                 minLabel={timeOptions[0]}
                 maxLabel={timeOptions[timeOptions.length - 1]}
                 value={timeSliderIndex}
                 min={0}
-                max={timeOptions.length - 1}
+                max={Math.max(0, timeOptions.length - 1)}
                 step={1}
                 onChange={(value) => updateState('timeLabel', timeOptions[value])}
                 onChangeEnd={() => triggerHeavyRecalc()}
@@ -714,12 +935,38 @@ function App() {
                 title="Row spacing (projected X gap)"
                 currentLabel={`${state.rowSpacingM.toFixed(1)} m`}
                 minLabel="min 0.0 m"
-                maxLabel="max 10.0 m"
+                maxLabel="max 3.0 m"
                 value={state.rowSpacingM}
                 min={0}
-                max={10}
+                max={3}
                 step={0.1}
                 onChange={(value) => updateState('rowSpacingM', value)}
+                onChangeEnd={() => triggerHeavyRecalc()}
+              />
+
+              <SliderControl
+                title="Gap between panels (cm)"
+                currentLabel={`${(state.panelGapM * 100).toFixed(0)} cm`}
+                minLabel="0 cm"
+                maxLabel="100 cm"
+                value={state.panelGapM * 100}
+                min={0}
+                max={100}
+                step={1}
+                onChange={(value) => updateState('panelGapM', value / 100)}
+                onChangeEnd={() => triggerHeavyRecalc()}
+              />
+
+              <SliderControl
+                title="Mounting height (cm)"
+                currentLabel={`${state.mountHeightCm} cm`}
+                minLabel="0 cm"
+                maxLabel="100 cm"
+                value={state.mountHeightCm}
+                min={0}
+                max={100}
+                step={5}
+                onChange={(value) => updateState('mountHeightCm', value)}
                 onChangeEnd={() => triggerHeavyRecalc()}
               />
 
@@ -774,10 +1021,10 @@ function App() {
                 title="Panels per row"
                 currentLabel={`${state.panelsPerRow} panels`}
                 minLabel="min 1"
-                maxLabel="max 10"
+                maxLabel="max 100"
                 value={state.panelsPerRow}
                 min={1}
-                max={10}
+                max={100}
                 onChange={(value) => updateState('panelsPerRow', value)}
                 onChangeEnd={() => triggerHeavyRecalc()}
               />
@@ -811,6 +1058,10 @@ function App() {
                 groundTiltDeg={state.groundTiltDeg}
                 groundTiltAzimuthDeg={state.groundTiltAzimuthDeg}
                 rowShadingFractions={fieldShading.rowShadingFractions}
+                panelGapM={state.panelGapM}
+                windAzimuthDeg={state.windAzimuthDeg}
+                windSpeedMs={state.windSpeedMs}
+                mountHeightM={state.mountHeightCm / 100}
               />
             </Card>
 
@@ -830,7 +1081,12 @@ function App() {
               </Card>
 
               <Card withBorder radius="md" className="metric-card">
-                <Text size="xs" c="dimmed">{monthOptions[state.monthIndex]} output</Text>
+                <Group justify="space-between" align="flex-start">
+                  <Text size="xs" c="dimmed">{currentDate.toLocaleDateString('en-GB', { month: 'long' })} output</Text>
+                  {yieldResult?.source === 'fallback' && (
+                    <Badge size="xs" color="orange" variant="light">Fallback Mode</Badge>
+                  )}
+                </Group>
                 <Title order={3}>{yieldResult ? `${toFixed(yieldResult.totalKwhMonth)} kWh` : '--'}</Title>
                 <Text size="xs" c="dimmed">Per panel: {yieldResult ? `${toFixed(yieldResult.perPanelKwhMonth)} kWh` : '--'}</Text>
               </Card>
@@ -844,19 +1100,19 @@ function App() {
               </Card>
 
               <Card withBorder radius="md" className="metric-card">
-                <Text size="xs" c="dimmed">Incidence X / Y</Text>
+                <Text size="xs" c="dimmed">Incidence offset</Text>
                 <Title order={3}>
-                  {toFixed(Math.abs(metrics.azimuthOffsetDeg), 1)}° / {toFixed(metrics.profileIncidenceDeg, 1)}°
+                  {toFixed(Math.abs(metrics.azimuthOffsetDeg), 1)}°
                 </Title>
-                <Text size="xs" c="dimmed">Az offset {toFixed(metrics.azimuthOffsetDeg, 1)}°</Text>
+                <Text size="xs" c="dimmed">Factor x{toFixed(metrics.incidenceFactor, 2)}</Text>
               </Card>
 
               <Card withBorder radius="md" className="metric-card">
-                <Text size="xs" c="dimmed">Shadow length</Text>
+                <Text size="xs" c="dimmed">Current power</Text>
                 <Title order={3}>
-                  {Number.isFinite(metrics.shadowLengthM) ? `${toFixed(metrics.shadowLengthM)} m` : 'Long'}
+                  {toFixed(currentPowerKw, 2)} kW
                 </Title>
-                <Text size="xs" c="dimmed">Geometric estimate</Text>
+                <Text size="xs" c="dimmed">Instant clear-sky estimate</Text>
               </Card>
 
               <Card withBorder radius="md" className="metric-card">
@@ -872,9 +1128,40 @@ function App() {
               </Card>
 
               <Card withBorder radius="md" className="metric-card">
-                <Text size="xs" c="dimmed">Incidence factor</Text>
-                <Title order={3}>{toFixed(metrics.incidenceFactor, 2)}</Title>
-                <Text size="xs" c="dimmed">cos(incidence angle)</Text>
+                <Text size="xs" c="dimmed">DC combination</Text>
+                <Title order={3}>
+                  {toFixed(systemVoltage, 0)} V / {toFixed(systemCurrent, 1)} A
+                </Title>
+                <Text size="xs" c="dimmed">Operating (Vmp / Imp)</Text>
+                {systemVoc > 0 && (
+                  <Text size="xs" fw={600} c="orange.8" mt={4}>
+                    Max Voc: {toFixed(systemVoc, 0)} V
+                  </Text>
+                )}
+              </Card>
+
+              <Card withBorder radius="md" className="metric-card">
+                <Text size="xs" c="dimmed">Wind drag</Text>
+                <Title order={3}>
+                  {toFixed(windDragKg, 1)} kg
+                </Title>
+                <Text size="xs" c="dimmed">Horizontal force</Text>
+              </Card>
+
+              <Card withBorder radius="md" className="metric-card">
+                <Text size="xs" c="dimmed">Lift force</Text>
+                <Title order={3}>
+                  {toFixed(windUpliftKg, 1)} kg
+                </Title>
+                <Text size="xs" c="dimmed">Vertical uplift force</Text>
+              </Card>
+
+              <Card withBorder radius="md" className="metric-card" bg="blue.9" c="white">
+                <Text size="xs" c="blue.1">Total wind load</Text>
+                <Title order={3} c="white">
+                  {toFixed(windTotalKg, 1)} kg
+                </Title>
+                <Text size="xs" c="blue.1">Resultant vector force</Text>
               </Card>
 
             </SimpleGrid>

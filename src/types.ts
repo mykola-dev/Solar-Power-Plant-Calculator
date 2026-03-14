@@ -33,6 +33,7 @@ export type CalculatorState = {
   rowsCount: number
   rowPitchM: number
   rowSpacingM: number
+  panelGapM: number
   tiltDeg: number
   groundTiltDeg: number
   groundTiltAzimuthDeg: number
@@ -40,9 +41,13 @@ export type CalculatorState = {
   panelAzimuthDeg: number
   latitude: number
   longitude: number
-  monthIndex: number
+  dayOfYear: number
   timeLabel: string
   performanceRatio: number
+  temperatureC: number
+  windSpeedMs: number
+  windAzimuthDeg: number
+  mountHeightCm: number
 }
 
 export type SolarMetrics = {

@@ -42,10 +42,8 @@ const suncalcAzimuthToCompassDeg = (suncalcAzimuthRad: number) => {
   return compass
 }
 
-const getRecommendedTilt = (latitude: number, monthIndex: number) => {
+const getRecommendedTilt = (latitude: number, dayOfYear: number) => {
   // Solar declination via Spencer approximation: δ = 23.45° × sin(2π(284+n)/365)
-  // n = representative day of year for each month (15th of month ≈ correct centre)
-  const dayOfYear = Math.round((monthIndex + 0.5) * (365 / 12))
   const declinationDeg = 23.45 * Math.sin((2 * Math.PI * (284 + dayOfYear)) / 365)
   // Optimal fixed tilt for single month ≈ latitude − declination (N hemisphere)
   // For S hemisphere panels face north, sign flips: |lat| + declination×sign(lat<0)
@@ -57,7 +55,7 @@ const getRecommendedTilt = (latitude: number, monthIndex: number) => {
 export type SolarInput = {
   latitude: number
   longitude: number
-  monthIndex: number
+  dayOfYear: number
   timeLabel: string
   tiltDeg: number
   panelAzimuthDeg: number
@@ -66,9 +64,45 @@ export type SolarInput = {
   orientation: 'portrait' | 'landscape'
 }
 
-export const getRepresentativeDate = (monthIndex: number) => {
+export const getDateFromDayOfYear = (dayOfYear: number) => {
   const year = new Date().getFullYear()
-  return new Date(year, monthIndex, 15, 12, 0, 0)
+  // Month is 0-indexed, but day of month can overflow to the correct month
+  const date = new Date(year, 0, dayOfYear, 12, 0, 0)
+  // Ensure we stick to the correct year even if it's a leap year quirk
+  if (date.getFullYear() > year) {
+    date.setFullYear(year)
+  }
+  return date
+}
+
+export const getSunriseSunsetOptions = (latitude: number, longitude: number, date: Date): string[] => {
+  const times = SunCalc.getTimes(date, latitude, longitude)
+  const sunrise = times.sunrise
+  const sunset = times.sunset
+
+  if (Number.isNaN(sunrise.getTime()) || Number.isNaN(sunset.getTime())) {
+    return ['12:00'] // Fallback if no sunrise/sunset (polar regions)
+  }
+
+  const options: string[] = []
+  // Start from sunrise hour:minute, round up to next 10-minute interval
+  const current = new Date(sunrise)
+  const minutes = current.getMinutes()
+  const remainder = minutes % 10
+  if (remainder !== 0) {
+    current.setMinutes(minutes + (10 - remainder))
+  }
+  current.setSeconds(0, 0)
+
+  // Stop exactly at or just before sunset
+  while (current <= sunset) {
+    const hh = String(current.getHours()).padStart(2, '0')
+    const mm = String(current.getMinutes()).padStart(2, '0')
+    options.push(`${hh}:${mm}`)
+    current.setMinutes(current.getMinutes() + 10)
+  }
+
+  return options.length > 0 ? options : ['12:00']
 }
 
 export const withTimeApplied = (baseDate: Date, timeLabel: string) => {
@@ -80,7 +114,7 @@ export const withTimeApplied = (baseDate: Date, timeLabel: string) => {
 }
 
 export const calculateSolarMetrics = (input: SolarInput): SolarMetrics => {
-  const representativeDate = getRepresentativeDate(input.monthIndex)
+  const representativeDate = getDateFromDayOfYear(input.dayOfYear)
   const selectedDate = withTimeApplied(representativeDate, input.timeLabel)
   const position = SunCalc.getPosition(selectedDate, input.latitude, input.longitude)
   const solarAltitudeDeg = toDegrees(position.altitude)
@@ -121,7 +155,7 @@ export const calculateSolarMetrics = (input: SolarInput): SolarMetrics => {
     solarAltitudeDeg,
     solarAzimuthDeg,
     azimuthOffsetDeg,
-    recommendedTiltDeg: getRecommendedTilt(input.latitude, input.monthIndex),
+    recommendedTiltDeg: getRecommendedTilt(input.latitude, input.dayOfYear),
     profileAltitudeDeg,
     profileIncidenceDeg,
     incidenceAngleDeg,

@@ -396,6 +396,14 @@ function App() {
       }),
     [rowConfigs, panelSpec.lengthMm, panelSpec.widthMm, state.tiltDeg, state.rowSpacingM, state.panelGapM, state.rowAlignment],
   )
+  const rowHeightStepM = Math.max(state.rowHeightStepCm / 100, 0)
+  const mountHeightM = Math.max(state.mountHeightCm / 100, 0)
+  const fieldWidthM = fieldLayout.fieldWidthM
+  const fieldLengthM = fieldLayout.fieldDepthM
+  const fieldHeightM = fieldLayout.rows.reduce(
+    (max, row) => Math.max(max, mountHeightM + row.panelTopHeightM + row.rowIndex * rowHeightStepM),
+    mountHeightM,
+  )
 
   const metrics = useMemo(
     () =>
@@ -426,7 +434,7 @@ function App() {
   const fieldShading = useMemo(() => {
     return calculateFieldShading({
       rows: fieldLayout.rows,
-      rowHeightStepM: state.rowHeightStepCm / 100,
+      rowHeightStepM,
       panelAzimuthDeg: state.panelAzimuthDeg,
       solarAzimuthDeg: metrics.solarAzimuthDeg,
       solarAltitudeDeg: metrics.solarAltitudeDeg,
@@ -437,7 +445,7 @@ function App() {
     })
   }, [
     fieldLayout.rows,
-    state.rowHeightStepCm,
+    rowHeightStepM,
     state.panelAzimuthDeg,
     metrics.solarAzimuthDeg,
     metrics.solarAltitudeDeg,
@@ -582,7 +590,6 @@ function App() {
 
   const totalPanels = rowConfigs.reduce((sum, row) => sum + row.panelsCount, 0)
   const totalSystemKw = (panelSpec.powerW * totalPanels) / 1000
-  const totalProjectedFieldWidthM = fieldLayout.fieldDepthM * Math.cos((Math.abs(state.groundTiltDeg) * Math.PI) / 180)
 
   // Real-time Clear Sky Simulation
   // Assuming a max clear-sky irradiance of 1000 W/m² (900 Direct + 100 Diffuse scatter)
@@ -653,7 +660,6 @@ function App() {
   // Shielding factor (Psi) based on d/h ratio
   // d = clear distance between rows (rowSpacingM)
   // h = total height (panelTopHeightM + mountHeightM)
-  const mountHeightM = state.mountHeightCm / 100
   const tallestPanelTopHeightM = fieldLayout.rows.reduce((max, row) => Math.max(max, row.panelTopHeightM), 0)
   const totalHeightH = Math.max(tallestPanelTopHeightM + mountHeightM, 0.1)
   const d_h_ratio = state.rowSpacingM / totalHeightH
@@ -1165,7 +1171,7 @@ function App() {
             <Card withBorder radius="lg" className="panel-card">
               <FieldScene3D
                 fieldLayout={fieldLayout}
-                rowHeightStepM={state.rowHeightStepCm / 100}
+                rowHeightStepM={rowHeightStepM}
                 metrics={metrics}
                 panelAzimuthDeg={state.panelAzimuthDeg}
                 groundTiltDeg={state.groundTiltDeg}
@@ -1173,7 +1179,7 @@ function App() {
                 rowShadingFractions={fieldShading.rowShadingFractions}
                 windAzimuthDeg={state.windAzimuthDeg}
                 windSpeedMs={state.windSpeedMs}
-                mountHeightM={state.mountHeightCm / 100}
+                mountHeightM={mountHeightM}
               />
             </Card>
 
@@ -1234,9 +1240,9 @@ function App() {
               </Card>
 
               <Card withBorder radius="md" className="metric-card">
-                <Text size="xs" c="dimmed">Field width</Text>
-                <Title order={3}>{toFixed(totalProjectedFieldWidthM, 2)} m</Title>
-                <Text size="xs" c="dimmed">Projected ground span</Text>
+                <Text size="xs" c="dimmed">Field size</Text>
+                <Title order={3}>{toFixed(fieldWidthM, 2)} x {toFixed(fieldLengthM, 2)} x {toFixed(fieldHeightM, 2)} m</Title>
+                <Text size="xs" c="dimmed">W {toFixed(fieldWidthM, 2)} m | L {toFixed(fieldLengthM, 2)} m | H {toFixed(fieldHeightM, 2)} m</Text>
               </Card>
 
               <Card withBorder radius="md" className="metric-card">

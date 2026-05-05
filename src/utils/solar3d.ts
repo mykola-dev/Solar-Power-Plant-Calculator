@@ -1,4 +1,4 @@
-import type { FieldShadingResult } from '../types'
+import type { FieldLayout, FieldShadingResult, Orientation, RowAlignment, RowConfig, RowLayout } from '../types'
 
 export type Vec3 = {
   x: number
@@ -7,12 +7,8 @@ export type Vec3 = {
 }
 
 type FieldShadingInput = {
-  rowsCount: number
-  panelsPerRow: number
-  rowSpacingM: number
-  panelRunM: number
-  panelTopHeightM: number
-  panelWidthAcrossRowM: number
+  rows: RowLayout[]
+  rowHeightStepM?: number
   panelAzimuthDeg: number
   solarAzimuthDeg: number
   solarAltitudeDeg: number
@@ -20,6 +16,16 @@ type FieldShadingInput = {
   groundTiltAzimuthDeg?: number
   sunAboveHorizon: boolean
   frontSideIrradiance: boolean
+}
+
+type Segment2D = {
+  start: number
+  end: number
+}
+
+type Point2D = {
+  x: number
+  y: number
 }
 
 const DEG_TO_RAD = Math.PI / 180
@@ -62,166 +68,200 @@ export const sunVectorToSkyENU = (solarAzimuthDeg: number, solarAltitudeDeg: num
 
 export const enuToThree = (value: Vec3): [number, number, number] => [value.x, value.z, -value.y]
 
-export const getPanelWidthAcrossRowMeters = (lengthMm: number, widthMm: number, orientation: 'portrait' | 'landscape') =>
+export const getPanelWidthAcrossRowMeters = (lengthMm: number, widthMm: number, orientation: Orientation) =>
   (orientation === 'portrait' ? widthMm : lengthMm) / 1000
 
+export const getPanelLengthInViewMeters = (lengthMm: number, widthMm: number, orientation: Orientation) =>
+  (orientation === 'portrait' ? lengthMm : widthMm) / 1000
+
+const overlapLength = (a: Segment2D, b: Segment2D) => Math.max(0, Math.min(a.end, b.end) - Math.max(a.start, b.start))
+
+export const normalizeRowConfigs = (rowConfigs: RowConfig[], rowsCount: number, fallback: RowConfig): RowConfig[] => {
+  const safeRowsCount = Math.max(1, Math.round(rowsCount))
+  const normalized: RowConfig[] = []
+
+  for (let rowIndex = 0; rowIndex < safeRowsCount; rowIndex += 1) {
+    const source = rowConfigs[rowIndex] ?? rowConfigs[rowConfigs.length - 1] ?? fallback
+    normalized.push({
+      orientation: source.orientation === 'landscape' ? 'landscape' : 'portrait',
+      panelsCount: clamp(Math.round(source.panelsCount), 1, 100),
+    })
+  }
+
+  return normalized
+}
+
+export const buildFieldLayout = ({
+  rowConfigs,
+  panelLengthMm,
+  panelWidthMm,
+  tiltDeg,
+  rowSpacingM,
+  panelGapM,
+  rowAlignment,
+}: {
+  rowConfigs: RowConfig[]
+  panelLengthMm: number
+  panelWidthMm: number
+  tiltDeg: number
+  rowSpacingM: number
+  panelGapM: number
+  rowAlignment: RowAlignment
+}): FieldLayout => {
+  const tiltRad = tiltDeg * DEG_TO_RAD
+  const safeGapM = Math.max(panelGapM, 0)
+  const safeSpacingM = Math.max(rowSpacingM, 0)
+
+  const rows = rowConfigs.map<RowLayout>((rowConfig, rowIndex) => {
+    const panelLengthM = getPanelLengthInViewMeters(panelLengthMm, panelWidthMm, rowConfig.orientation)
+    const panelRunM = panelLengthM * Math.cos(tiltRad)
+    const panelTopHeightM = panelLengthM * Math.sin(tiltRad)
+    const panelWidthAcrossRowM = getPanelWidthAcrossRowMeters(panelLengthMm, panelWidthMm, rowConfig.orientation)
+    const rowLengthM = rowConfig.panelsCount * panelWidthAcrossRowM + Math.max(rowConfig.panelsCount - 1, 0) * safeGapM
+
+    return {
+      rowIndex,
+      orientation: rowConfig.orientation,
+      panelsCount: rowConfig.panelsCount,
+      panelLengthM,
+      panelRunM,
+      panelTopHeightM,
+      panelWidthAcrossRowM,
+      panelGapM: safeGapM,
+      rowLengthM,
+      baseOffsetM: 0,
+      leftEdgeOffsetM: 0,
+    }
+  })
+
+  const fieldWidthM = rows.reduce((max, row) => Math.max(max, row.rowLengthM), 0)
+  let nextOffsetM = 0
+
+  rows.forEach((row) => {
+    row.baseOffsetM = nextOffsetM
+    nextOffsetM += row.panelRunM + safeSpacingM
+
+    if (rowAlignment === 'left') {
+      row.leftEdgeOffsetM = 0
+    } else if (rowAlignment === 'right') {
+      row.leftEdgeOffsetM = fieldWidthM - row.rowLengthM
+    } else {
+      row.leftEdgeOffsetM = (fieldWidthM - row.rowLengthM) / 2
+    }
+  })
+
+  const fieldDepthM = rows.length > 0 ? rows[rows.length - 1].baseOffsetM + rows[rows.length - 1].panelRunM : 0
+
+  return {
+    rows,
+    fieldWidthM,
+    fieldDepthM,
+  }
+}
+
+const rotatePoint = (point: Point2D, angleRad: number): Point2D => ({
+  x: point.x * Math.cos(angleRad) - point.y * Math.sin(angleRad),
+  y: point.x * Math.sin(angleRad) + point.y * Math.cos(angleRad),
+})
+
+const cross2D = (a: Point2D, b: Point2D) => a.x * b.y - a.y * b.x
+
+type RowCrossSection = {
+  base: Point2D
+  top: Point2D
+  lateral: Segment2D
+}
+
+const buildCrossSectionRows = (
+  rows: RowLayout[],
+  panelAzimuthDeg: number,
+  groundTiltDeg: number,
+  groundTiltAzimuthDeg: number,
+  rowHeightStepM: number,
+) => {
+  const panelSouthProjection = Math.cos((panelAzimuthDeg - 180) * DEG_TO_RAD)
+  const panelLeansLeft = panelSouthProjection >= 0
+  const groundTiltAlongFaceRad = groundTiltDeg * DEG_TO_RAD * Math.cos((groundTiltAzimuthDeg - panelAzimuthDeg) * DEG_TO_RAD)
+
+  return rows.map<RowCrossSection>((row, rowIndex) => {
+    const projectedPanelRunM = Math.max(Math.abs(panelSouthProjection) * row.panelRunM, 0.01)
+    const heightOffsetM = rowIndex * rowHeightStepM
+    const baseFlat: Point2D = { x: row.baseOffsetM, y: 0 }
+    const topFlat: Point2D = {
+      x: row.baseOffsetM + (panelLeansLeft ? projectedPanelRunM : -projectedPanelRunM),
+      y: row.panelTopHeightM,
+    }
+    const baseRotated = rotatePoint(baseFlat, groundTiltAlongFaceRad)
+    const topRotated = rotatePoint(topFlat, groundTiltAlongFaceRad)
+
+    return {
+      base: { x: baseRotated.x, y: baseRotated.y + heightOffsetM },
+      top: { x: topRotated.x, y: topRotated.y + heightOffsetM },
+      lateral: {
+        start: row.leftEdgeOffsetM,
+        end: row.leftEdgeOffsetM + row.rowLengthM,
+      },
+    }
+  })
+}
+
 /**
- * Inter-row shading using the **profile angle method** — the standard approach
- * in solar engineering.
- *
- * The 3D problem is reduced to a 2D cross-section perpendicular to the row axis:
- *   1. Compute the *profile angle* — the sun's apparent altitude when projected
- *      onto the plane perpendicular to the row axis.
- *   2. In this 2D view, each row is a line segment from its base (ground level)
- *      to its top (elevated edge). The shading cast by one row onto the next is
- *      determined by tracing a ray from the occluding row's top edge at the
- *      profile angle and finding where it intersects the target row's segment.
- *   3. All panels within a row receive the same shading fraction (uniform along
- *      the row axis).
- *
- * This correctly handles diagonal sun angles that caused the previous 3D
- * ray-tracing approach to overshoot panel bounds.
+ * Inter-row shading with mixed row geometry.
+ * Cross-section math handles height/run, lateral overlap handles row-length alignment,
+ * and diagonal sun shifts the shadow along the row width.
  */
 export const calculateFieldShading = (input: FieldShadingInput): FieldShadingResult => {
-  const safeRowsCount = Math.max(input.rowsCount, 0)
-  const safePanelsPerRow = Math.max(input.panelsPerRow, 0)
+  const safeRows = input.rows
+  const totalPanels = safeRows.reduce((sum, row) => sum + row.panelsCount, 0)
 
-  // Sun below horizon → all panels fully shaded (no direct sunlight)
   if (!input.sunAboveHorizon) {
     return {
       fieldShadingPercent: 100,
       maxPanelShadingPercent: 100,
-      rowShadingFractions: Array.from({ length: safeRowsCount }, () => 1),
-      panelShadingFractions: Array.from({ length: safeRowsCount * safePanelsPerRow }, () => 1),
+      rowShadingFractions: Array.from({ length: safeRows.length }, () => 1),
+      panelShadingFractions: Array.from({ length: totalPanels }, () => 1),
     }
   }
 
-  if (
-    safeRowsCount < 2 ||
-    safePanelsPerRow < 1 ||
-    input.panelRunM <= 0 ||
-    input.panelTopHeightM <= 0 ||
-    input.panelWidthAcrossRowM <= 0 ||
-    !input.frontSideIrradiance
-  ) {
+  if (safeRows.length < 2 || !input.frontSideIrradiance) {
     return {
       fieldShadingPercent: 0,
       maxPanelShadingPercent: 0,
-      rowShadingFractions: Array.from({ length: safeRowsCount }, () => 0),
-      panelShadingFractions: Array.from({ length: safeRowsCount * safePanelsPerRow }, () => 0),
+      rowShadingFractions: Array.from({ length: safeRows.length }, () => 0),
+      panelShadingFractions: Array.from({ length: totalPanels }, () => 0),
     }
   }
 
-  // ----- Profile angle computation -----
-  // The profile angle is the sun's apparent altitude projected onto the plane
-  // perpendicular to the row axis.  For panel azimuth A and sun azimuth S:
-  //   azimuthOffset = S − A
-  //   profileAngle  = atan( tan(sunAlt) / |cos(azimuthOffset)| )
-  // When the sun is nearly parallel to the rows (|cos(azOff)| → 0) the profile
-  // angle approaches 90° and there is no inter-row shadow — which is correct.
+  const rowHeightStepM = Math.max(input.rowHeightStepM ?? 0, 0)
+  const groundTiltDeg = input.groundTiltDeg ?? 0
+  const groundTiltAzimuthDeg = input.groundTiltAzimuthDeg ?? 0
+  const rows2D = buildCrossSectionRows(safeRows, input.panelAzimuthDeg, groundTiltDeg, groundTiltAzimuthDeg, rowHeightStepM)
+
   const sunAltRad = input.solarAltitudeDeg * DEG_TO_RAD
   const azimuthOffsetRad = (input.solarAzimuthDeg - input.panelAzimuthDeg) * DEG_TO_RAD
   const cosAzOff = Math.cos(azimuthOffsetRad)
-  // Clamp denominator to avoid division by zero when sun is nearly along the rows
   const profileAngleRad = Math.atan(Math.tan(sunAltRad) / Math.max(Math.abs(cosAzOff), 0.01))
-
-  // ----- 2D cross-section geometry -----
-  // Convention matches solarMath.ts:
-  //   x-axis = horizontal axis in the cross-section
-  //   y-axis = vertical (up)
-  //   Rows are spaced along x-axis at intervals of rowPitchM.
-  //
-  // panelSouthProjection projects the panel run onto the "south" axis to
-  // determine how the panel leans in the cross-section.
-  // For panelAz=180 (south-facing), panelSouthProjection=cos(0)=1, panel leans left.
-  const panelSouthProjection = Math.cos((input.panelAzimuthDeg - 180) * DEG_TO_RAD)
-  const panelLeansLeft = panelSouthProjection >= 0
-  const projectedPanelRunM = Math.max(Math.abs(panelSouthProjection) * input.panelRunM, 0.01)
-  const rowPitchM = input.rowSpacingM + projectedPanelRunM
-
-  // Apply ground tilt: project the tilt onto the cross-section plane.
-  // groundTiltAlongFaceRad is positive when the ground slopes down toward the
-  // panel face direction (e.g., south for south-facing panels).
-  //
-  // UI convention: positive groundTiltDeg means "surface falls toward
-  // groundTiltAzimuthDeg." In the 2D cross-section we need ground sloping
-  // down toward north (+x) to LOWER northern points → clockwise rotation
-  // (negative angle). cos(groundTiltAzDeg - panelAzDeg) is +1 when tilt
-  // direction matches face direction (south), −1 when opposite (north).
-  //
-  // The sign is embedded in cos(groundTiltAzDeg - panelAzDeg):
-  //   same direction → +1 → positive angle → CW rotation → lowers back rows
-  //   opposite → -1 → negative angle → CCW rotation → raises back rows
-  const groundTiltDeg = input.groundTiltDeg ?? 0
-  const groundTiltAzDeg = input.groundTiltAzimuthDeg ?? 0
-  const groundTiltAlongFaceRad = groundTiltDeg * DEG_TO_RAD *
-    Math.cos((groundTiltAzDeg - input.panelAzimuthDeg) * DEG_TO_RAD)
-
-  type Point2D = { x: number; y: number }
-
-  const rotatePoint = (p: Point2D, angleRad: number): Point2D => ({
-    x: p.x * Math.cos(angleRad) - p.y * Math.sin(angleRad),
-    y: p.x * Math.sin(angleRad) + p.y * Math.cos(angleRad),
-  })
-
-  // Build row positions in 2D cross-section.
-  // Row i: base at (i * rowPitchM, 0), top displaced by panel geometry.
-  // Panel leans left (toward -x) when facing south — the back edge (base) is at ground level,
-  // the top edge (front, south) is elevated and displaced backward.
-  const rows2D: { base: Point2D; top: Point2D }[] = []
-  for (let i = 0; i < safeRowsCount; i += 1) {
-    const baseFlat: Point2D = { x: i * rowPitchM, y: 0 }
-    const topFlat: Point2D = {
-      x: i * rowPitchM + (panelLeansLeft ? projectedPanelRunM : -projectedPanelRunM),
-      y: input.panelTopHeightM,
-    }
-    rows2D.push({
-      base: rotatePoint(baseFlat, groundTiltAlongFaceRad),
-      top: rotatePoint(topFlat, groundTiltAlongFaceRad),
-    })
-  }
-
-  // ----- Sun direction in 2D cross-section -----
-  // Cross-section layout: row 0 at x=0, row 1 at x=rowPitchM, etc.
-  // For south-facing panels: +x = NORTH, row 0 is southernmost (closest to sun).
-  //
-  // sunSouthProjection: positive when sun is from the south half.
-  // When positive, the sun illuminates from the -x side (toward row 0).
-  //   → The FRONT row (row 0) casts shadow onto the BACK row (row 1).
-  //   → Occluder for targetIdx is targetIdx - 1 (lower index = closer to sun).
-  //   → Shadow ray goes in +x direction (away from the sun, toward higher indices).
-  const sunSouthProjection = Math.cos((input.solarAzimuthDeg - 180) * DEG_TO_RAD)
-  const sunFromLeft = sunSouthProjection >= 0 // sun illuminates from -x side
-
-  // Shadow ray direction: from occluder top, going AWAY from the sun (downward at the profile angle).
-  // Sun from left (-x) → shadow extends to the right (+x), so rayDx = +1.
-  // Sun from right (+x) → shadow extends to the left (-x), so rayDx = -1.
   const profileAngleClamped = Math.max(profileAngleRad, 0.005)
-  const rayDx = sunFromLeft ? 1 : -1
+  const panelAxisOffsetRad = (input.solarAzimuthDeg - input.panelAzimuthDeg - 90) * DEG_TO_RAD
+  const lateralShiftPerDepth = Math.tan(panelAxisOffsetRad)
+  const sunSouthProjection = Math.cos((input.solarAzimuthDeg - 180) * DEG_TO_RAD)
+  const sunFromFront = sunSouthProjection >= 0
+  const rayDx = sunFromFront ? 1 : -1
   const rayDy = -Math.tan(profileAngleClamped)
   const rayLen = Math.hypot(rayDx, rayDy)
   const rayDir: Point2D = { x: rayDx / rayLen, y: rayDy / rayLen }
 
-  // ----- Compute shading for each row -----
-  const cross2D = (a: Point2D, b: Point2D) => a.x * b.y - a.y * b.x
-
   const rowShadingFractions: number[] = []
   const panelShadingFractions: number[] = []
+  let weightedShadeSum = 0
 
-  for (let targetIdx = 0; targetIdx < safeRowsCount; targetIdx += 1) {
-    // Occluder: the adjacent row on the sun's side (between the sun and the target).
-    // Sun from left (-x): occluder is at lower index (targetIdx - 1).
-    // Sun from right (+x): occluder is at higher index (targetIdx + 1).
-    const occluderIdx = sunFromLeft ? targetIdx - 1 : targetIdx + 1
-
+  for (let targetIdx = 0; targetIdx < safeRows.length; targetIdx += 1) {
+    const occluderIdx = sunFromFront ? targetIdx - 1 : targetIdx + 1
     let rowFraction = 0
 
-    if (occluderIdx >= 0 && occluderIdx < safeRowsCount) {
+    if (occluderIdx >= 0 && occluderIdx < safeRows.length) {
       const occluder = rows2D[occluderIdx]
       const target = rows2D[targetIdx]
-
-      // Trace ray from occluder's top edge in rayDir.
-      // Find intersection with target panel segment (base → top).
       const segDir: Point2D = { x: target.top.x - target.base.x, y: target.top.y - target.base.y }
       const delta: Point2D = { x: target.base.x - occluder.top.x, y: target.base.y - occluder.top.y }
       const denom = cross2D(rayDir, segDir)
@@ -230,26 +270,38 @@ export const calculateFieldShading = (input: FieldShadingInput): FieldShadingRes
         const rayT = cross2D(delta, segDir) / denom
         const segT = cross2D(delta, rayDir) / denom
 
-        // rayT > 0 = forward along ray; segT ∈ [0,1] = within panel segment.
-        // segT=0 at base, segT=1 at top.
-        // Shadow covers base to intersection point.
         if (rayT > 0 && segT > 0 && segT <= 1) {
-          rowFraction = clamp(segT, 0, 1)
+          const crossSectionFraction = clamp(segT, 0, 1)
+          const shadowShiftM = lateralShiftPerDepth * (target.base.x - occluder.top.x)
+          const shiftedShadow: Segment2D = {
+            start: occluder.lateral.start + shadowShiftM,
+            end: occluder.lateral.end + shadowShiftM,
+          }
+          const overlapM = overlapLength(shiftedShadow, target.lateral)
+          const overlapFraction = target.lateral.end > target.lateral.start ? overlapM / (target.lateral.end - target.lateral.start) : 0
+          rowFraction = clamp(crossSectionFraction * overlapFraction, 0, 1)
         } else if (rayT > 0 && segT > 1) {
-          // Shadow covers the entire panel
-          rowFraction = 1
+          const shadowShiftM = lateralShiftPerDepth * (target.base.x - occluder.top.x)
+          const shiftedShadow: Segment2D = {
+            start: occluder.lateral.start + shadowShiftM,
+            end: occluder.lateral.end + shadowShiftM,
+          }
+          const overlapM = overlapLength(shiftedShadow, target.lateral)
+          const overlapFraction = target.lateral.end > target.lateral.start ? overlapM / (target.lateral.end - target.lateral.start) : 0
+          rowFraction = clamp(overlapFraction, 0, 1)
         }
       }
     }
 
     rowShadingFractions.push(rowFraction)
-    for (let p = 0; p < safePanelsPerRow; p += 1) {
+    weightedShadeSum += rowFraction * safeRows[targetIdx].panelsCount
+    for (let panelIndex = 0; panelIndex < safeRows[targetIdx].panelsCount; panelIndex += 1) {
       panelShadingFractions.push(rowFraction)
     }
   }
 
   const maxPanelFraction = panelShadingFractions.reduce((max, value) => Math.max(max, value), 0)
-  const fieldFraction = rowShadingFractions.reduce((sum, value) => sum + value, 0) / Math.max(rowShadingFractions.length, 1)
+  const fieldFraction = totalPanels > 0 ? weightedShadeSum / totalPanels : 0
 
   return {
     fieldShadingPercent: clamp(fieldFraction * 100, 0, 100),

@@ -18,13 +18,18 @@
   backdrop-filter: blur(6px);
 }
 
+.panel-card .mantine-Card-section,
+.panel-card .mantine-Card-root {
+  min-width: 0;
+}
+
 .metric-card {
   background: linear-gradient(155deg, rgba(16, 24, 35, 0.96), rgba(10, 14, 23, 0.94));
   border-color: rgba(97, 124, 160, 0.28);
 }
 
 .slider-control {
-  padding: 0.2rem 0.35rem 0.7rem;
+  padding: 0.15rem 0.2rem 0.55rem;
 }
 
 .slider-header {

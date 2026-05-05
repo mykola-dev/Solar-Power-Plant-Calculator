@@ -1,8 +1,8 @@
 import {
   Badge,
   Card,
-  Group,
   Divider,
+  Group,
   Grid,
   NumberInput,
   Select,
@@ -21,14 +21,12 @@ import {
   kharkivDefaults,
 } from './utils/constants'
 import { calculateSolarMetrics, getDateFromDayOfYear, getSunriseSunsetOptions } from './utils/solarMath'
-import { calculateFieldShading, getPanelWidthAcrossRowMeters } from './utils/solar3d'
+import { buildFieldLayout, calculateFieldShading, normalizeRowConfigs } from './utils/solar3d'
 import { estimateMonthlyYield } from './utils/yieldEstimator'
-import type { CalculatorState, Orientation, PanelSpec, YieldResult } from './types'
+import type { CalculatorState, PanelSpec, RowAlignment, RowConfig, YieldResult } from './types'
 import { FieldScene3D } from './components/FieldScene3D'
 
 const LOCAL_STORAGE_KEY = 'solar-calculator-v3-state'
-
-const DEG_TO_RAD = Math.PI / 180
 
 const getPanelSpecForState = (calculatorState: CalculatorState): PanelSpec => {
   if (calculatorState.panelSelection === 'custom') {
@@ -38,45 +36,25 @@ const getPanelSpecForState = (calculatorState: CalculatorState): PanelSpec => {
   return panelPresets.find((preset) => preset.id === calculatorState.panelSelection) ?? calculatorState.customPanel
 }
 
-const getPanelLengthInViewM = (panel: PanelSpec, orientation: Orientation) =>
-  (orientation === 'portrait' ? panel.lengthMm : panel.widthMm) / 1000
-
-const getPanelRunMForState = (calculatorState: CalculatorState) => {
-  const panel = getPanelSpecForState(calculatorState)
-  const panelLengthM = getPanelLengthInViewM(panel, calculatorState.orientation)
-  return panelLengthM * Math.cos(calculatorState.tiltDeg * DEG_TO_RAD)
+const DEFAULT_ROW_CONFIG: RowConfig = {
+  orientation: 'portrait',
+  panelsCount: 20,
 }
 
-const withSpacingConstraint = (calculatorState: CalculatorState): CalculatorState => {
-  const panelRunM = getPanelRunMForState(calculatorState)
-  const rowPitchM = Math.max(calculatorState.rowPitchM, panelRunM)
-  const rowSpacingM = Math.max(0, rowPitchM - panelRunM)
-
-  if (rowPitchM === calculatorState.rowPitchM && rowSpacingM === calculatorState.rowSpacingM) {
-    return calculatorState
-  }
-
-  return {
-    ...calculatorState,
-    rowPitchM,
-    rowSpacingM,
-  }
-}
-
-const initialPanelRunM = (panelPresets[0].lengthMm / 1000) * Math.cos(45 * DEG_TO_RAD)
+const MAX_ROWS = 5
 
 const initialState: CalculatorState = {
   panelSelection: panelPresets[0].id,
   customPanel: customPanelDefaults,
-  panelsPerRow: 20,
+  rowConfigs: [DEFAULT_ROW_CONFIG, { ...DEFAULT_ROW_CONFIG }],
   rowsCount: 2,
-  rowPitchM: 1.5 + initialPanelRunM,
+  rowHeightStepCm: 0,
   rowSpacingM: 1.5,
   panelGapM: 0,
   tiltDeg: 35,
   groundTiltDeg: 0,
   groundTiltAzimuthDeg: 0,
-  orientation: 'portrait',
+  rowAlignment: 'center',
   panelAzimuthDeg: 180,
   latitude: kharkivDefaults.latitude,
   longitude: kharkivDefaults.longitude,
@@ -134,6 +112,7 @@ type SliderControlProps = {
   min: number
   max: number
   step?: number
+  disabled?: boolean
   onChange: (value: number) => void
   onChangeEnd: () => void
 }
@@ -147,6 +126,7 @@ const SliderControl = ({
   min,
   max,
   step,
+  disabled,
   onChange,
   onChangeEnd,
 }: SliderControlProps) => (
@@ -165,6 +145,7 @@ const SliderControl = ({
       min={min}
       max={max}
       step={step}
+      disabled={disabled}
       label={null}
       onChange={onChange}
       onChangeEnd={onChangeEnd}
@@ -196,13 +177,18 @@ type HeavyPayload = {
 
 const buildHeavyPayload = (calculatorState: CalculatorState): HeavyPayload => {
   const selectedPanel = getPanelSpecForState(calculatorState)
-
-  const panelWidthAcrossRowM = getPanelWidthAcrossRowMeters(
-    selectedPanel.lengthMm,
-    selectedPanel.widthMm,
-    calculatorState.orientation,
-  )
-  const totalPanels = calculatorState.rowsCount * calculatorState.panelsPerRow
+  const rowConfigs = getNormalizedRowConfigs(calculatorState)
+  const totalPanels = rowConfigs.reduce((sum, row) => sum + row.panelsCount, 0)
+  const fieldLayout = buildFieldLayout({
+    rowConfigs,
+    panelLengthMm: selectedPanel.lengthMm,
+    panelWidthMm: selectedPanel.widthMm,
+    tiltDeg: calculatorState.tiltDeg,
+    rowSpacingM: calculatorState.rowSpacingM,
+    panelGapM: calculatorState.panelGapM,
+    rowAlignment: calculatorState.rowAlignment,
+  })
+  const representativeOrientation = rowConfigs[0]?.orientation ?? DEFAULT_ROW_CONFIG.orientation
 
   // Calculate daily average shading for the HeavyPayload so the monthly yield doesn't jump with the Time of Day slider.
   // We use an irradiance-weighted average: shadows at noon matter more than shadows at sunrise.
@@ -221,7 +207,7 @@ const buildHeavyPayload = (calculatorState: CalculatorState): HeavyPayload => {
       panelAzimuthDeg: calculatorState.panelAzimuthDeg,
       rowSpacingM: calculatorState.rowSpacingM,
       panelSpec: selectedPanel,
-      orientation: calculatorState.orientation,
+      orientation: representativeOrientation,
     })
 
     // Weight by incidence factor (clamped to 0 for sun behind panels)
@@ -229,12 +215,8 @@ const buildHeavyPayload = (calculatorState: CalculatorState): HeavyPayload => {
 
     if (weight > 1e-6) {
       const tempShading = calculateFieldShading({
-        rowsCount: calculatorState.rowsCount,
-        panelsPerRow: calculatorState.panelsPerRow,
-        rowSpacingM: calculatorState.rowSpacingM,
-        panelRunM: tempMetrics.panelRunM,
-        panelTopHeightM: tempMetrics.panelTopHeightM,
-        panelWidthAcrossRowM,
+        rows: fieldLayout.rows,
+        rowHeightStepM: calculatorState.rowHeightStepCm / 100,
         panelAzimuthDeg: calculatorState.panelAzimuthDeg,
         solarAzimuthDeg: tempMetrics.solarAzimuthDeg,
         solarAltitudeDeg: tempMetrics.solarAltitudeDeg,
@@ -271,9 +253,12 @@ const sanitizeNumber = (value: unknown, fallback: number, min: number, max: numb
   return Math.min(max, Math.max(min, value))
 }
 
+const getNormalizedRowConfigs = (calculatorState: CalculatorState) =>
+  normalizeRowConfigs(calculatorState.rowConfigs, calculatorState.rowsCount, DEFAULT_ROW_CONFIG)
+
 const sanitizeState = (raw: unknown): CalculatorState => {
   if (!raw || typeof raw !== 'object') {
-    return withSpacingConstraint(initialState)
+    return initialState
   }
 
   const candidate = raw as Partial<CalculatorState>
@@ -282,10 +267,29 @@ const sanitizeState = (raw: unknown): CalculatorState => {
   const panelExists = candidate.panelSelection === 'custom' || panelPresets.some((panel) => panel.id === candidate.panelSelection)
 
   const panelSelection = panelExists && typeof candidate.panelSelection === 'string' ? candidate.panelSelection : initialState.panelSelection
-  const orientation = candidate.orientation === 'landscape' ? 'landscape' : 'portrait'
-
-  const sanitizedRowsCount = sanitizeNumber(candidate.rowsCount, initialState.rowsCount, 1, 5)
+  const sanitizedRowsCount = sanitizeNumber(candidate.rowsCount, initialState.rowsCount, 1, MAX_ROWS)
   const derivedPanelsPerRowFromLegacy = legacyPanelCount ? Math.max(1, Math.round(legacyPanelCount / sanitizedRowsCount)) : undefined
+  const legacyOrientation = (raw as { orientation?: unknown }).orientation === 'landscape' ? 'landscape' : 'portrait'
+  const fallbackPanelsCount = sanitizeNumber(
+    derivedPanelsPerRowFromLegacy ?? (raw as { panelsPerRow?: unknown }).panelsPerRow,
+    DEFAULT_ROW_CONFIG.panelsCount,
+    1,
+    100,
+  )
+  const legacyRowConfig: RowConfig = {
+    orientation: legacyOrientation,
+    panelsCount: fallbackPanelsCount,
+  }
+  const rawRowConfigs = Array.isArray(candidate.rowConfigs) ? candidate.rowConfigs : []
+  const rowConfigs = normalizeRowConfigs(
+    rawRowConfigs.map((row) => ({
+      orientation: row?.orientation === 'landscape' ? 'landscape' : 'portrait',
+      panelsCount: sanitizeNumber(row?.panelsCount, fallbackPanelsCount, 1, 100),
+    })),
+    sanitizedRowsCount,
+    legacyRowConfig,
+  )
+  const rowAlignment: RowAlignment = candidate.rowAlignment === 'left' || candidate.rowAlignment === 'right' ? candidate.rowAlignment : 'center'
 
   const sanitized: CalculatorState = {
     panelSelection,
@@ -299,25 +303,15 @@ const sanitizeState = (raw: unknown): CalculatorState => {
       isc: sanitizeNumber(candidate.customPanel?.isc, initialState.customPanel.isc, 2, 25),
       imp: sanitizeNumber(candidate.customPanel?.imp, initialState.customPanel.imp, 2, 25),
     },
-    panelsPerRow: sanitizeNumber(
-      (candidate as { panelsPerRow?: number }).panelsPerRow ?? derivedPanelsPerRowFromLegacy,
-      initialState.panelsPerRow,
-      1,
-      100,
-    ),
+    rowConfigs,
     rowsCount: sanitizedRowsCount,
-    rowPitchM: sanitizeNumber(
-      candidate.rowPitchM,
-      sanitizeNumber(candidate.rowSpacingM, initialState.rowSpacingM, 0, 10) + initialPanelRunM,
-      0,
-      20,
-    ),
+    rowHeightStepCm: sanitizeNumber(candidate.rowHeightStepCm, initialState.rowHeightStepCm, 0, 200),
     rowSpacingM: sanitizeNumber(candidate.rowSpacingM, initialState.rowSpacingM, 0, 10),
     panelGapM: sanitizeNumber(candidate.panelGapM, initialState.panelGapM, 0, 1.0),
     tiltDeg: sanitizeNumber(candidate.tiltDeg, initialState.tiltDeg, 0, 90),
     groundTiltDeg: sanitizeNumber(candidate.groundTiltDeg, initialState.groundTiltDeg, -10, 10),
     groundTiltAzimuthDeg: sanitizeNumber(candidate.groundTiltAzimuthDeg, initialState.groundTiltAzimuthDeg, -180, 180),
-    orientation,
+    rowAlignment,
     panelAzimuthDeg: sanitizeNumber(candidate.panelAzimuthDeg, initialState.panelAzimuthDeg, 0, 360),
     latitude: sanitizeNumber(candidate.latitude, initialState.latitude, -90, 90),
     longitude: sanitizeNumber(candidate.longitude, initialState.longitude, -180, 180),
@@ -333,19 +327,19 @@ const sanitizeState = (raw: unknown): CalculatorState => {
     mountHeightCm: sanitizeNumber(candidate.mountHeightCm, initialState.mountHeightCm, 0, 100),
   }
 
-  return withSpacingConstraint(sanitized)
+  return sanitized
 }
 
 const loadInitialState = (): CalculatorState => {
   try {
     const stored = window.localStorage.getItem(LOCAL_STORAGE_KEY)
     if (!stored) {
-      return withSpacingConstraint(initialState)
+      return initialState
     }
 
     return sanitizeState(JSON.parse(stored))
   } catch {
-    return withSpacingConstraint(initialState)
+    return initialState
   }
 }
 
@@ -357,6 +351,21 @@ function App() {
 
   const selectedPreset = panelPresets.find((preset) => preset.id === state.panelSelection)
   const panelSpec: PanelSpec = state.panelSelection === 'custom' || !selectedPreset ? state.customPanel : selectedPreset
+  const rowConfigs = useMemo(() => getNormalizedRowConfigs(state), [state])
+  const representativeOrientation = rowConfigs[0]?.orientation ?? DEFAULT_ROW_CONFIG.orientation
+  const fieldLayout = useMemo(
+    () =>
+      buildFieldLayout({
+        rowConfigs,
+        panelLengthMm: panelSpec.lengthMm,
+        panelWidthMm: panelSpec.widthMm,
+        tiltDeg: state.tiltDeg,
+        rowSpacingM: state.rowSpacingM,
+        panelGapM: state.panelGapM,
+        rowAlignment: state.rowAlignment,
+      }),
+    [rowConfigs, panelSpec.lengthMm, panelSpec.widthMm, state.tiltDeg, state.rowSpacingM, state.panelGapM, state.rowAlignment],
+  )
 
   const metrics = useMemo(
     () =>
@@ -369,7 +378,7 @@ function App() {
         panelAzimuthDeg: state.panelAzimuthDeg,
         rowSpacingM: state.rowSpacingM,
         panelSpec,
-        orientation: state.orientation,
+        orientation: representativeOrientation,
       }),
     [
       state.latitude,
@@ -379,20 +388,15 @@ function App() {
       state.tiltDeg,
       state.panelAzimuthDeg,
       state.rowSpacingM,
-      state.orientation,
+      representativeOrientation,
       panelSpec,
     ],
   )
 
   const fieldShading = useMemo(() => {
-    const panelWidthAcrossRowM = getPanelWidthAcrossRowMeters(panelSpec.lengthMm, panelSpec.widthMm, state.orientation)
     return calculateFieldShading({
-      rowsCount: state.rowsCount,
-      panelsPerRow: state.panelsPerRow,
-      rowSpacingM: state.rowSpacingM,
-      panelRunM: metrics.panelRunM,
-      panelTopHeightM: metrics.panelTopHeightM,
-      panelWidthAcrossRowM,
+      rows: fieldLayout.rows,
+      rowHeightStepM: state.rowHeightStepCm / 100,
       panelAzimuthDeg: state.panelAzimuthDeg,
       solarAzimuthDeg: metrics.solarAzimuthDeg,
       solarAltitudeDeg: metrics.solarAltitudeDeg,
@@ -402,15 +406,9 @@ function App() {
       frontSideIrradiance: metrics.frontSideIrradiance,
     })
   }, [
-    state.rowsCount,
-    state.panelsPerRow,
-    state.rowSpacingM,
-    state.orientation,
+    fieldLayout.rows,
+    state.rowHeightStepCm,
     state.panelAzimuthDeg,
-    panelSpec.lengthMm,
-    panelSpec.widthMm,
-    metrics.panelRunM,
-    metrics.panelTopHeightM,
     metrics.solarAzimuthDeg,
     metrics.solarAltitudeDeg,
     state.groundTiltDeg,
@@ -436,7 +434,7 @@ function App() {
         shadingLossFactor: heavyPayload.shadingLossFactor,
         panelAzimuthDeg: heavyPayload.panelAzimuthDeg,
         rowSpacingM: state.rowSpacingM,
-        orientation: state.orientation,
+        orientation: representativeOrientation,
       })
 
       if (!active) {
@@ -452,27 +450,19 @@ function App() {
     return () => {
       active = false
     }
-  }, [heavyPayload, state.rowSpacingM, state.orientation])
+  }, [heavyPayload, state.rowSpacingM, representativeOrientation])
 
   useEffect(() => {
     window.localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(state))
   }, [state])
 
   const triggerHeavyRecalc = (nextState?: CalculatorState) => {
-    setHeavyPayload(buildHeavyPayload(withSpacingConstraint(nextState ?? state)))
+    setHeavyPayload(buildHeavyPayload(nextState ?? state))
   }
 
   const updateState = <K extends keyof CalculatorState>(key: K, value: CalculatorState[K], trigger = false) => {
     setState((prev) => {
-      const nextRaw =
-        key === 'rowSpacingM'
-          ? {
-            ...prev,
-            rowSpacingM: value as number,
-            rowPitchM: (value as number) + getPanelRunMForState(prev),
-          }
-          : { ...prev, [key]: value }
-      const next = withSpacingConstraint(nextRaw)
+      const next = { ...prev, [key]: value }
       if (trigger) {
         triggerHeavyRecalc(next)
       }
@@ -480,13 +470,49 @@ function App() {
     })
   }
 
+  const updateRowsCount = (rowsCount: number) => {
+    setState((prev) => {
+      const safeRowsCount = Math.max(1, Math.min(MAX_ROWS, rowsCount))
+      const currentRows = getNormalizedRowConfigs(prev)
+      const nextRows = currentRows.slice(0, safeRowsCount)
+
+      while (nextRows.length < safeRowsCount) {
+        nextRows.push({ ...(nextRows[nextRows.length - 1] ?? DEFAULT_ROW_CONFIG) })
+      }
+
+      const next = {
+        ...prev,
+        rowsCount: safeRowsCount,
+        rowConfigs: nextRows,
+      }
+      return next
+    })
+  }
+
+  const updateRowConfig = <K extends keyof RowConfig>(rowIndex: number, key: K, value: RowConfig[K], trigger = false) => {
+    setState((prev) => {
+      const nextRows = getNormalizedRowConfigs(prev).map((row, index) =>
+        index === rowIndex ? { ...row, [key]: value } : row,
+      )
+      const next = {
+        ...prev,
+        rowConfigs: nextRows,
+      }
+
+      if (trigger) {
+        triggerHeavyRecalc(next)
+      }
+
+      return next
+    })
+  }
+
   const updateCustomPanel = <K extends keyof PanelSpec>(key: K, value: PanelSpec[K], trigger = false) => {
     setState((prev) => {
-      const nextRaw = {
+      const next = {
         ...prev,
         customPanel: { ...prev.customPanel, [key]: value },
       }
-      const next = withSpacingConstraint(nextRaw)
 
       if (trigger) {
         triggerHeavyRecalc(next)
@@ -524,12 +550,9 @@ function App() {
     timeSliderIndex = closestIdx
   }
 
-  const totalPanels = state.panelsPerRow * state.rowsCount
+  const totalPanels = rowConfigs.reduce((sum, row) => sum + row.panelsCount, 0)
   const totalSystemKw = (panelSpec.powerW * totalPanels) / 1000
-  const projectedPanelRunM = Math.abs(Math.cos(((state.panelAzimuthDeg - 180) * Math.PI) / 180)) * metrics.panelRunM
-  const baseFieldWidthX =
-    state.rowsCount > 0 ? state.rowsCount * projectedPanelRunM + Math.max(state.rowsCount - 1, 0) * state.rowSpacingM : 0
-  const totalProjectedFieldWidthM = baseFieldWidthX * Math.cos((Math.abs(state.groundTiltDeg) * Math.PI) / 180)
+  const totalProjectedFieldWidthM = fieldLayout.fieldDepthM * Math.cos((Math.abs(state.groundTiltDeg) * Math.PI) / 180)
 
   // Real-time Clear Sky Simulation
   // Assuming a max clear-sky irradiance of 1000 W/m² (900 Direct + 100 Diffuse scatter)
@@ -557,8 +580,9 @@ function App() {
     let activeSystemVoltage = 0
 
     // Calculate total power and voltage considering shading
-    for (let r = 0; r < state.rowsCount; r++) {
+    for (let r = 0; r < rowConfigs.length; r++) {
       const rowShadeFraction = fieldShading.rowShadingFractions[r] ?? 0
+      const rowPanelsCount = rowConfigs[r]?.panelsCount ?? 0
 
       // Bypass Diode Model:
       // When a section of a panel is shaded, bypass diodes activate to prevent high series resistance
@@ -566,7 +590,7 @@ function App() {
       // from the total string summation, but enabling the unshaded sections to pass optimal current.
       // We assume shade triggers proportional fractional diode bypass.
       const activeVoltageFraction = 1 - rowShadeFraction
-      const rowActiveVoltage = vmpAdjusted * state.panelsPerRow * activeVoltageFraction
+      const rowActiveVoltage = vmpAdjusted * rowPanelsCount * activeVoltageFraction
       activeSystemVoltage += rowActiveVoltage
 
       // Direct light is linearly blocked by shade. Diffuse light remains fully available.
@@ -574,14 +598,14 @@ function App() {
       const directIncidentW = rawDirectW * (1 - rowShadeFraction)
       const totalIrradianceW = directIncidentW + diffuseW
       // Module efficiency converts irradiance into electricity
-      const rowPowerW = totalIrradianceW * panelSpec.lengthMm / 1000 * panelSpec.widthMm / 1000 * panelSpec.efficiency / 100 * state.panelsPerRow
+      const rowPowerW = totalIrradianceW * panelSpec.lengthMm / 1000 * panelSpec.widthMm / 1000 * panelSpec.efficiency / 100 * rowPanelsCount
       currentPowerKw += rowPowerW / 1000
     }
 
     // Assign final bypassed total voltage block
     systemVoltage = activeSystemVoltage
     // Voc is the "safety" voltage, usually we care about the cold Voc of the entire string
-    systemVoc = vocAdjusted * (state.rowsCount * state.panelsPerRow)
+    systemVoc = vocAdjusted * totalPanels
 
     // In a pure series connection, system current is effectively total Power / total Voltage
     systemCurrent = systemVoltage > 0 ? (currentPowerKw * 1000) / systemVoltage : 0
@@ -600,15 +624,16 @@ function App() {
   // d = clear distance between rows (rowSpacingM)
   // h = total height (panelTopHeightM + mountHeightM)
   const mountHeightM = state.mountHeightCm / 100
-  const totalHeightH = Math.max(metrics.panelTopHeightM + mountHeightM, 0.1)
+  const tallestPanelTopHeightM = fieldLayout.rows.reduce((max, row) => Math.max(max, row.panelTopHeightM), 0)
+  const totalHeightH = Math.max(tallestPanelTopHeightM + mountHeightM, 0.1)
   const d_h_ratio = state.rowSpacingM / totalHeightH
   const psi = d_h_ratio <= 2.0 ? 0.53 : d_h_ratio >= 4.0 ? 1.0 : 0.53 + (d_h_ratio - 2.0) * (0.47 / 2.0)
 
   let totalUpliftN = 0
   let totalDragN = 0
 
-  for (let r = 0; r < state.rowsCount; r++) {
-    const rowArea = state.panelsPerRow * panelAreaM2
+  for (let r = 0; r < rowConfigs.length; r++) {
+    const rowArea = (rowConfigs[r]?.panelsCount ?? 0) * panelAreaM2
     let cp_uplift = 1.5 // Multiplier for exposed row
 
     if (isNorthWind) {
@@ -652,9 +677,9 @@ function App() {
 
   return (
     <Stack className="app-shell" gap="lg">
-      <Grid gutter="lg">
+      <Grid gutter="lg" columns={20}>
         {/* Input column A: panel, time/month, orientation */}
-        <Grid.Col span={{ base: 12, md: 6, xl: 3 }}>
+        <Grid.Col span={{ base: 20, md: 10, xl: 4 }}>
           <Card withBorder radius="lg" className="panel-card" h="100%">
             <Stack gap="md">
               <Title order={4} className="input-col-title">Panel &amp; Time</Title>
@@ -881,23 +906,15 @@ function App() {
                 />
               </SimpleGrid>
 
-              <SegmentedControl
-                data={[
-                  { label: 'Portrait', value: 'portrait' },
-                  { label: 'Landscape', value: 'landscape' },
-                ]}
-                value={state.orientation}
-                onChange={(value) => updateState('orientation', value as Orientation, true)}
-              />
             </Stack>
           </Card>
         </Grid.Col>
 
-        {/* Input column B: geometry, tilt, field layout */}
-        <Grid.Col span={{ base: 12, md: 6, xl: 3 }}>
+        {/* Input column B: geometry and spacing */}
+        <Grid.Col span={{ base: 20, md: 10, xl: 4 }}>
           <Card withBorder radius="lg" className="panel-card" h="100%">
             <Stack gap="md">
-              <Title order={4} className="input-col-title">Field Geometry</Title>
+              <Title order={4} className="input-col-title">Field Layout</Title>
 
               <SliderControl
                 title="Facing direction"
@@ -944,6 +961,16 @@ function App() {
                 onChangeEnd={() => triggerHeavyRecalc()}
               />
 
+              <SegmentedControl
+                data={[
+                  { label: 'Left', value: 'left' },
+                  { label: 'Center', value: 'center' },
+                  { label: 'Right', value: 'right' },
+                ]}
+                value={state.rowAlignment}
+                onChange={(value) => updateState('rowAlignment', value as RowAlignment, true)}
+              />
+
               <SliderControl
                 title="Gap between panels (cm)"
                 currentLabel={`${(state.panelGapM * 100).toFixed(0)} cm`}
@@ -969,6 +996,81 @@ function App() {
                 onChange={(value) => updateState('mountHeightCm', value)}
                 onChangeEnd={() => triggerHeavyRecalc()}
               />
+            </Stack>
+          </Card>
+        </Grid.Col>
+
+        {/* Input column C: rows, terrain, performance */}
+        <Grid.Col span={{ base: 20, md: 10, xl: 4 }}>
+          <Card withBorder radius="lg" className="panel-card" h="100%">
+            <Stack gap="md">
+              <Title order={4} className="input-col-title">Rows &amp; Ground</Title>
+
+              <SliderControl
+                title="Rows"
+                currentLabel={`${state.rowsCount} rows`}
+                minLabel="min 1"
+                maxLabel={`max ${MAX_ROWS}`}
+                value={state.rowsCount}
+                min={1}
+                max={MAX_ROWS}
+                onChange={(value) => updateRowsCount(value)}
+                onChangeEnd={() => triggerHeavyRecalc()}
+              />
+
+              <SliderControl
+                title="Row height step"
+                currentLabel={`${state.rowHeightStepCm} cm / row`}
+                minLabel="0 cm"
+                maxLabel="200 cm"
+                value={state.rowHeightStepCm}
+                min={0}
+                max={200}
+                step={1}
+                disabled={state.rowsCount === 1}
+                onChange={(value) => updateState('rowHeightStepCm', value)}
+                onChangeEnd={() => triggerHeavyRecalc()}
+              />
+
+              <Stack gap="sm">
+                <Group justify="space-between">
+                  <Text size="sm" c="dimmed">Per-row layout</Text>
+                  <Text size="xs" c="dimmed">Orientation and module count</Text>
+                </Group>
+
+                {rowConfigs.map((row, rowIndex) => (
+                  <Card key={rowIndex} withBorder radius="md" className="metric-card">
+                    <Stack gap="sm">
+                      <Group justify="space-between" align="center">
+                        <Text fw={600}>Row {rowIndex + 1}</Text>
+                        <Text size="xs" c="dimmed">{row.panelsCount} panels</Text>
+                      </Group>
+
+                      <SegmentedControl
+                        data={[
+                          { label: 'Portrait', value: 'portrait' },
+                          { label: 'Landscape', value: 'landscape' },
+                        ]}
+                        value={row.orientation}
+                        onChange={(value) => updateRowConfig(rowIndex, 'orientation', value as RowConfig['orientation'], true)}
+                      />
+
+                      <SliderControl
+                        title="Panels"
+                        currentLabel={`${row.panelsCount}`}
+                        minLabel="1"
+                        maxLabel="100"
+                        value={row.panelsCount}
+                        min={1}
+                        max={100}
+                        step={1}
+                        onChange={(value) => updateRowConfig(rowIndex, 'panelsCount', value)}
+                        onChangeEnd={() => triggerHeavyRecalc()}
+                      />
+                    </Stack>
+                  </Card>
+                ))}
+              </Stack>
 
               <SliderControl
                 title="Ground tilt"
@@ -1016,49 +1118,22 @@ function App() {
                 onChange={(value) => updateState('performanceRatio', value)}
                 onChangeEnd={() => triggerHeavyRecalc()}
               />
-
-              <SliderControl
-                title="Panels per row"
-                currentLabel={`${state.panelsPerRow} panels`}
-                minLabel="min 1"
-                maxLabel="max 100"
-                value={state.panelsPerRow}
-                min={1}
-                max={100}
-                onChange={(value) => updateState('panelsPerRow', value)}
-                onChangeEnd={() => triggerHeavyRecalc()}
-              />
-
-              <SliderControl
-                title="Rows"
-                currentLabel={`${state.rowsCount} rows`}
-                minLabel="min 1"
-                maxLabel="max 5"
-                value={state.rowsCount}
-                min={1}
-                max={5}
-                onChange={(value) => updateState('rowsCount', value)}
-                onChangeEnd={() => triggerHeavyRecalc()}
-              />
             </Stack>
           </Card>
         </Grid.Col>
 
         {/* Results column */}
-        <Grid.Col span={{ base: 12, md: 12, xl: 6 }}>
+        <Grid.Col span={{ base: 20, md: 20, xl: 8 }}>
           <Stack gap="lg">
             <Card withBorder radius="lg" className="panel-card">
               <FieldScene3D
-                rowsCount={state.rowsCount}
-                panelsPerRow={state.panelsPerRow}
-                rowPitchM={state.rowPitchM}
-                panelWidthAcrossRowM={getPanelWidthAcrossRowMeters(panelSpec.lengthMm, panelSpec.widthMm, state.orientation)}
+                fieldLayout={fieldLayout}
+                rowHeightStepM={state.rowHeightStepCm / 100}
                 metrics={metrics}
                 panelAzimuthDeg={state.panelAzimuthDeg}
                 groundTiltDeg={state.groundTiltDeg}
                 groundTiltAzimuthDeg={state.groundTiltAzimuthDeg}
                 rowShadingFractions={fieldShading.rowShadingFractions}
-                panelGapM={state.panelGapM}
                 windAzimuthDeg={state.windAzimuthDeg}
                 windSpeedMs={state.windSpeedMs}
                 mountHeightM={state.mountHeightCm / 100}

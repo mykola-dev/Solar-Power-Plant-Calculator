@@ -1,5 +1,12 @@
 export type Orientation = 'portrait' | 'landscape'
 
+export type RowAlignment = 'left' | 'center' | 'right'
+
+export type RowConfig = {
+  orientation: Orientation
+  panelsCount: number
+}
+
 export type PanelPreset = {
   id: string
   brand: string
@@ -29,15 +36,15 @@ export type PanelSpec = {
 export type CalculatorState = {
   panelSelection: string
   customPanel: PanelSpec
-  panelsPerRow: number
+  rowConfigs: RowConfig[]
   rowsCount: number
-  rowPitchM: number
+  rowHeightStepCm: number
   rowSpacingM: number
   panelGapM: number
   tiltDeg: number
   groundTiltDeg: number
   groundTiltAzimuthDeg: number
-  orientation: Orientation
+  rowAlignment: RowAlignment
   panelAzimuthDeg: number
   latitude: number
   longitude: number
@@ -48,6 +55,26 @@ export type CalculatorState = {
   windSpeedMs: number
   windAzimuthDeg: number
   mountHeightCm: number
+}
+
+export type RowLayout = {
+  rowIndex: number
+  orientation: Orientation
+  panelsCount: number
+  panelLengthM: number
+  panelRunM: number
+  panelTopHeightM: number
+  panelWidthAcrossRowM: number
+  panelGapM: number
+  rowLengthM: number
+  baseOffsetM: number
+  leftEdgeOffsetM: number
+}
+
+export type FieldLayout = {
+  rows: RowLayout[]
+  fieldWidthM: number
+  fieldDepthM: number
 }
 
 export type SolarMetrics = {

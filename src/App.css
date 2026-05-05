@@ -59,6 +59,24 @@
 
 .panel-option-cell {
   padding-block: 0.15rem;
+  min-width: min(68rem, calc(100vw - 3rem));
+}
+
+.panel-model-select {
+  width: 100%;
+}
+
+.panel-model-select .mantine-Select-dropdown,
+.panel-model-select .mantine-Combobox-dropdown {
+  width: min(68rem, calc(100vw - 2rem));
+  min-width: min(68rem, calc(100vw - 2rem));
+  max-width: calc(100vw - 2rem);
+  max-height: calc(100vh - 2rem);
+}
+
+.panel-model-select .mantine-Combobox-options,
+.panel-model-select .mantine-Select-options {
+  max-height: calc(100vh - 8rem);
 }
 
 .scene3d-shell {

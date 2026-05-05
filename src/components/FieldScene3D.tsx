@@ -109,6 +109,8 @@ const RowPanels = React.memo(({
   const halfThickness = 0.018
   const geometry = useMemo(() => {
     const nextGeometry = new THREE.BoxGeometry(Math.max(row.panelWidthAcrossRowM, 0.25), halfThickness, row.panelLengthM)
+    // Local origin sits on the lower front mounting edge. The panel extends toward
+    // local -Z and lifts upward after tilt, matching the field layout anchor.
     nextGeometry.translate(0, halfThickness / 2, -row.panelLengthM / 2)
     return nextGeometry
   }, [halfThickness, row.panelLengthM, row.panelWidthAcrossRowM])
@@ -316,8 +318,8 @@ export function FieldScene3D(props: FieldScene3DProps) {
             position={sunPosition}
             shadow-mapSize-width={2048}
             shadow-mapSize-height={2048}
-            shadow-bias={-0.00005}
-            shadow-normalBias={0.0002}
+            shadow-bias={-0.00015}
+            shadow-normalBias={0}
           >
             <object3D attach="target" position={[0, 0, 0]} />
             <orthographicCamera attach="shadow-camera" args={[-24, 24, 24, -24, 0.1, 120]} />

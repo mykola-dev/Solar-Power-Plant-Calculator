@@ -43,8 +43,38 @@ const DEFAULT_ROW_CONFIG: RowConfig = {
 
 const MAX_ROWS = 5
 
+const BRAND_PRIORITY: Record<string, number> = {
+  AIKO: 0,
+  'Jinko Solar': 1,
+  LONGi: 2,
+  'JA Solar': 3,
+  'Trina Solar': 4,
+  'Canadian Solar': 5,
+  'Risen Energy': 6,
+  Risen: 7,
+}
+
+const getPanelSortRank = (panel: PanelSpec & { brand?: string; model?: string; powerW: number; lengthMm: number; efficiency: number }) => {
+  const isCompact = panel.lengthMm <= 1800
+  const compactBucket = isCompact ? 0 : 1
+  const brandRank = BRAND_PRIORITY[panel.brand ?? ''] ?? 99
+  return [compactBucket, brandRank, -panel.efficiency, -panel.powerW, panel.lengthMm, panel.model ?? '']
+}
+
+const sortedPanelPresets = [...panelPresets].sort((a, b) => {
+  const aRank = getPanelSortRank(a)
+  const bRank = getPanelSortRank(b)
+
+  for (let i = 0; i < aRank.length; i += 1) {
+    if (aRank[i] < bRank[i]) return -1
+    if (aRank[i] > bRank[i]) return 1
+  }
+
+  return 0
+})
+
 const initialState: CalculatorState = {
-  panelSelection: panelPresets[0].id,
+  panelSelection: sortedPanelPresets[0].id,
   customPanel: customPanelDefaults,
   rowConfigs: [DEFAULT_ROW_CONFIG, { ...DEFAULT_ROW_CONFIG }],
   rowsCount: 2,
@@ -72,7 +102,7 @@ const initialState: CalculatorState = {
 const toFixed = (value: number, digits = 2) => Number(value.toFixed(digits))
 
 const panelSelectData = [
-  ...panelPresets.map((panel) => ({
+  ...sortedPanelPresets.map((panel) => ({
     value: panel.id,
     label: `${panel.brand} ${panel.model}`,
   })),
@@ -80,7 +110,7 @@ const panelSelectData = [
 ]
 
 const panelOptionsById = new Map(
-  panelPresets.map((panel) => [
+  sortedPanelPresets.map((panel) => [
     panel.id,
     `${panel.lengthMm}x${panel.widthMm} mm, ${panel.powerW}W, Voc ${panel.voc}V, Isc ${panel.isc}A`,
   ]),
@@ -689,6 +719,13 @@ function App() {
                 value={state.panelSelection}
                 data={panelSelectData}
                 renderOption={renderPanelOption}
+                comboboxProps={{
+                  width: 'min(calc(100vw - 2rem), 72rem)',
+                  position: 'bottom-start',
+                  middlewares: { flip: true, shift: true },
+                }}
+                maxDropdownHeight={Math.max(420, typeof window !== 'undefined' ? window.innerHeight - 120 : 720)}
+                className="panel-model-select"
                 onChange={(value) => {
                   if (!value) {
                     return
